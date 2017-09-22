@@ -23,6 +23,6 @@
     "express": "4.15.4",
     "lodash": "4.17.4",
     "path": "0.12.7",
-    "websocket-node": "0.1.0"
+    "websocket": "1.0.24"
   }
 }
