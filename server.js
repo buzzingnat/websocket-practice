@@ -2,6 +2,7 @@ var express = require(`express`);
 var path = require(`path`);
 var bodyParser = require(`body-parser`);
 var WebSocketServer = require('websocket').server;
+var crypto = require('crypto');
 
 var app = express();
 // needed for heroku to work right
@@ -36,31 +37,90 @@ wsServer = new WebSocketServer({
 });
 
 function originIsAllowed(origin) {
-  // put logic here to detect whether the specified origin is allowed.
-  return true;
+    // put logic here to detect whether the specified origin is allowed.
+    return true;
+}
+
+// Maps privateId => publicId
+var privateIdMap = {};
+// Maps publicId => playerObject
+var players = {};
+// Maps privateId => web socket connection (used for broadcasting to all players).
+var connections = {};
+
+function broadcast(data) {
+    for (var id in connections) connections[id].sendUTF(JSON.stringify(data));
 }
 
 wsServer.on('request', function(request) {
+    var privateId, publicId;
     if (!originIsAllowed(request.origin)) {
-      // Make sure we only accept requests from an allowed origin
-      request.reject();
-      console.log((new Date()) + ' Connection from origin ' + request.origin + ' rejected.');
-      return;
+        // Make sure we only accept requests from an allowed origin
+        request.reject();
+        console.log((new Date()) + ' Connection from origin ' + request.origin + ' rejected.');
+        return;
     }
 
     var connection = request.accept(null, request.origin);
     console.log((new Date()) + ' Connection accepted.');
     connection.on('message', function(message) {
-        if (message.type === 'utf8') {
-            console.log('Received Message: ' + message.utf8Data);
-            connection.sendUTF(message.utf8Data);
+        // We only handle utf8 encoded json messages.
+        if (message.type !== 'utf8') return;
+        console.log('Received Message: ' + message.utf8Data);
+        try {
+            var data = JSON.parse(message.utf8Data);
+        } catch (e) {
+            connection.sendUTF(JSON.stringify({errorMessage: 'Could not parse json'}));
+            return;
         }
-        else if (message.type === 'binary') {
-            console.log('Received Binary Message of ' + message.binaryData.length + ' bytes');
-            connection.sendBytes(message.binaryData);
+        if (!data.privateId) {
+            do {
+                privateId = crypto.createHash('md5').update('' + Math.random()).digest("hex");
+            } while (privateIdMap[privateId]);
+            do {
+                publicId = crypto.createHash('md5').update('' + Math.random()).digest("hex");
+            } while (players[publicId]);
+            privateIdMap[privateId] = publicId;
+            players[publicId] = {id: publicId, name: data.name || 'Incognito' + publicId.substring(0, 6), score: 0};
+            console.log("Added player");
+            console.log(players);
+            // When a player first logs in we send them their public/private ids and the full list of player data.
+            connection.sendUTF(JSON.stringify({privateId, publicId, players}));
+            // Broadcast to all other players that the new player has joined.
+            broadcast({playerJoined: players[publicId]});
+            connections[privateId] = connection;
+            return;
         }
+        if (privateIdMap[data.privateId]) {
+            privateId = data.privateId;
+            publicId = privateIdMap[data.privateId];
+            // If a new connection is opened for an existing player, close the
+            // old connection and store the new one.
+            if (connections[privateId] !== connection) {
+                // Close the previous connection if it exists.
+                if (connections[privateId]) connections[privateId].close();
+                connections[privateId] = connection;
+            }
+            if (data.action === 'score') {
+                players[publicId].score++;
+                broadcast({playerUpdate: {id: publicId, score: players[publicId].score}});
+                console.log(`Player ${publicId} scored`);
+                console.log(players);
+            }
+            return;
+        }
+        connection.sendUTF(JSON.stringify({errorMessage: `Player id ${data.privateId} not found.`}));
     });
     connection.on('close', function(reasonCode, description) {
         console.log((new Date()) + ' Peer ' + connection.remoteAddress + ' disconnected.');
+        // If the most recent connection for a private id closes, purge it from memory
+        if (connections[privateId] === connection) {
+            delete connections[privateId];
+            delete players[publicId];
+            delete privateIdMap[privateId];
+            console.log(`Player ${publicId} left`);
+            console.log(players);
+            broadcast({playerLeft: publicId});
+        }
     });
 });
